@@ -2,18 +2,20 @@
 classify_transactions.py
 
 Reads uncategorised transactions out of transactions.db (created by
-build_db.py) one calendar day at a time, sends each day's batch to
-Gemma 4 31B (via LiteLLM / the Gemini API) for categorisation, and
-writes the results back to the same row.
+build_db.py) one calendar day at a time, sends each day's batch to a local
+Gemma 4 12B model running under Ollama (via LiteLLM), and writes the
+results back to the same row.
 
 Setup:
-    export GEMINI_API_KEY="your-key-here"
+    ollama pull gemma4:12b
+    ollama serve                      # if not already running as a service
     pip install litellm sqlalchemy
 
+    # optional, only needed if Ollama isn't on the default host/port:
+    export OLLAMA_API_BASE="http://localhost:11434"
+
 Usage:
-    python classify_transactions.py --db transactions.db
-    python classify_transactions.py --db transactions.db --limit 5   # first 5 days only, for testing
-    python classify_transactions.py --db transactions.db --recategorise  # ignore existing categories
+    python classify_transactions.py
 """
 
 import json
@@ -21,10 +23,13 @@ import os
 import time
 from collections import defaultdict
 
-import litellm
+import ollama
 from sqlalchemy import MetaData, Table, create_engine, select, update
 
-MODEL = "gemini/gemma-4-31b-it"  # served via the Gemini API; needs GEMINI_API_KEY
+MODEL = "gemma4:12b"  # local model served by Ollama
+API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
+client = ollama.Client(host=API_BASE)
+
 
 CATEGORIES = [
     "Groceries",
@@ -75,16 +80,15 @@ def classify_day(day, rows, model=MODEL, max_retries=3):
     )
     for attempt in range(max_retries):
         try:
-            response = litellm.completion(
+            response = client.chat(
                 model=model,
                 messages=[
                     {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + user_prompt},
                 ],
-                temperature=0,
-                api_key=os.getenv("GEMINI_API_KEY"),
-                response_format={"type": "json_object"},
+                format="json",
+                options={"temperature": 0},
             )
-            content = response.choices[0].message.content
+            content = response.message.content
             parsed = json.loads(content)
             categories = parsed["categories"]
 
@@ -149,7 +153,7 @@ def main():
             day_rows = by_day[day]
             print(f"Classifying {day} ({len(day_rows)} transactions)...")
 
-            categories = classify_day(day, day_rows, model="gemini/gemma-4-31b-it")
+            categories = classify_day(day, day_rows, model=MODEL)
 
             for row, category in zip(day_rows, categories):
                 if category is None:
@@ -160,9 +164,8 @@ def main():
                     .values(category=category)
                 )
                 total_classified += 1
-        last_processed_date = day_rows[-1].date
-        conn.execute(update(state).values(date_classified_upto=last_processed_date))
-        conn.commit()
+                conn.execute(update(state).values(date_classified_upto=day))
+                conn.commit()
 
     print(f"Done. Classified {total_classified}/{len(all_rows)} transactions.")
 
