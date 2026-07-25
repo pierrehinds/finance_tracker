@@ -1,19 +1,18 @@
+"""
+models.py
+
+SQLAlchemy models shared across the project — build_db.py, classify_transactions.py,
+the FastAPI backend, etc. all import from here so there's exactly one definition
+of the schema.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import (
-    Column,
-    Date,
-    Float,
-    Integer,
-    String,
-    Time,
-)
-from sqlalchemy import (
-    Enum as SAEnum,
-)
+from sqlalchemy import Column, Date, Float, Integer, String, Time
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -51,11 +50,12 @@ class Transaction(Base):
 
     __tablename__ = "transactions"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_id = Column(
+        String(36), primary_key=True
+    )  # Monzo Transaction ID / Amex Reference, or a computed id for Nationwide — see build_db.py
 
     # Provenance
     source = Column(String, nullable=False)  # 'monzo' | 'amex' | 'nationwide'
-    source_id = Column(String, nullable=True)  # Monzo Transaction ID / Amex Reference
 
     # When
     date = Column(Date, nullable=False)

@@ -164,7 +164,7 @@ def main():
                     continue
                 conn.execute(
                     update(transactions)
-                    .where(transactions.c.id == row.id)
+                    .where(transactions.c.source_id == row.source_id)
                     .values(category=Category(category))
                 )
                 total_classified += 1

@@ -16,6 +16,31 @@ Category convention:
     no category at all, so `category` is left NULL for those rows — something
     downstream (rules/LLM) still needs to fill those in.
 
+ID / re-run convention:
+    `source_id` is the primary key — a deterministic string, not an autoincrement
+    integer — so re-running this script against overlapping or updated exports is
+    a MERGE, not a wipe:
+      - Monzo / Amex:  source_id = the bank's own native id (Transaction ID / Reference), used as-is
+      - Nationwide:    source_id = base64(f"{balance}|{date}|{description}")[:36]
+    Re-running with the same source data produces the same source_ids, so
+    existing rows get updated in place (via session.merge) rather than
+    duplicated, and the whole table is never dropped. See TransactionLoader.make_id().
+
+    Caveat: Nationwide has no per-transaction id from the bank, so its id is
+    derived from (balance, date, description). Two genuinely distinct
+    transactions on the same day, same description, that happen to leave the
+    account at the same running balance, would collide onto the same id and
+    the second would silently overwrite the first. This is rare in practice
+    but worth knowing about.
+
+    Caveat 2: because this is now a merge, re-running build_db.py will
+    overwrite every field of a matching row with whatever's in the fresh CSV —
+    EXCEPT `category`, which is deliberately preserved if a row already has one
+    and the freshly-loaded row doesn't (see FinanceDatabaseBuilder.build()).
+    Otherwise, re-running after classify_transactions.py has filled in
+    Nationwide categories would wipe them straight back to NULL, since
+    NationwideLoader never produces a category itself.
+
 Everything here is class-based and importable — no argparse, no CLI-only logic.
 Typical use, from another script:
 
@@ -36,6 +61,7 @@ the bottom of the file.
 
 from __future__ import annotations
 
+import base64
 import csv
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -44,14 +70,13 @@ from pathlib import Path
 from typing import ClassVar
 
 from models.tables import Base, Category, State, Transaction
-from sqlalchemy import (
-    create_engine,
-)
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 # ---------------------------------------------------------------------------
-# Loaders — one per bank. Each knows how to parse its own CSV quirks and how
-# to map its own category scheme onto the canonical `Category` enum.
+# Loaders — one per bank. Each knows how to parse its own CSV quirks, how to
+# compute a deterministic id, and how to map its own category scheme onto the
+# canonical `Category` enum.
 # ---------------------------------------------------------------------------
 
 
@@ -69,6 +94,12 @@ class TransactionLoader(ABC):
         if value == "":
             return 0.0
         return float(value)
+
+    @staticmethod
+    def make_id(*parts) -> str:
+        """Deterministic id: base64 of the parts joined with '|', truncated to 36 chars."""
+        raw = "|".join("" if p is None else str(p) for p in parts)
+        return base64.b64encode(raw.encode("utf-8")).decode("ascii")[:36]
 
     @abstractmethod
     def load(self, path: str | Path) -> list[Transaction]:
@@ -93,11 +124,20 @@ class MonzoLoader(TransactionLoader):
                         time_val = None
 
                 raw_category = r.get("Category") or None
+                source_id = r.get("Transaction ID") or None
+
+                if not source_id:
+                    # Shouldn't normally happen — Monzo always gives a Transaction ID —
+                    # but fall back to something stable rather than crashing the ingest.
+                    print(
+                        f"  [{self.source_name}] row with no Transaction ID on {r.get('Date')} — using fallback id"
+                    )
+                    source_id = self.make_id(date, r.get("Name"), r.get("Amount"))
 
                 rows.append(
                     Transaction(
+                        source_id=source_id,
                         source=self.source_name,
-                        source_id=r.get("Transaction ID") or None,
                         date=date,
                         time=time_val,
                         description=r.get("Name") or r.get("Description") or "",
@@ -184,11 +224,20 @@ class AmexLoader(TransactionLoader):
                 amount = -self.parse_money(r.get("Amount"))
 
                 raw_category = r.get("Category") or None
+                source_id = (r.get("Reference") or "").strip("'") or None
+
+                if not source_id:
+                    print(
+                        f"  [{self.source_name}] row with no Reference on {r.get('Date')} — using fallback id"
+                    )
+                    source_id = self.make_id(
+                        date, r.get("Description"), r.get("Amount")
+                    )
 
                 rows.append(
                     Transaction(
+                        source_id=source_id,
                         source=self.source_name,
-                        source_id=(r.get("Reference") or "").strip("'") or None,
                         date=date,
                         time=None,
                         description=r.get("Description") or "",
@@ -250,14 +299,20 @@ class NationwideLoader(TransactionLoader):
 
             balance_raw = r.get("Balance")
             balance = self.parse_money(balance_raw) if balance_raw else None
+            description = r.get("Description") or ""
+
+            # Nationwide gives no per-transaction id at all, so source_id is derived
+            # from (balance, date, description) — see the module docstring caveat
+            # about the (rare) collision risk this carries.
+            source_id = self.make_id(balance, date, description)
 
             rows.append(
                 Transaction(
+                    source_id=source_id,
                     source=self.source_name,
-                    source_id=None,  # Nationwide doesn't provide a per-transaction ID
                     date=date,
                     time=None,
-                    description=r.get("Description") or "",
+                    description=description,
                     amount=amount,
                     currency="GBP",
                     balance=balance,
@@ -283,13 +338,18 @@ class NationwideLoader(TransactionLoader):
 @dataclass
 class BuildReport:
     db_path: Path
-    total: int = 0
+    total_processed: int = 0
+    total_in_db: int = 0
     per_source: dict[str, int] = field(default_factory=dict)
     per_source_categorised: dict[str, int] = field(default_factory=dict)
 
     @classmethod
-    def from_rows(cls, db_path: Path, rows: list[Transaction]) -> BuildReport:
-        report = cls(db_path=db_path, total=len(rows))
+    def from_rows(
+        cls, db_path: Path, rows: list[Transaction], total_in_db: int
+    ) -> BuildReport:
+        report = cls(
+            db_path=db_path, total_processed=len(rows), total_in_db=total_in_db
+        )
         for row in rows:
             report.per_source[row.source] = report.per_source.get(row.source, 0) + 1
             if row.category is not None:
@@ -299,15 +359,18 @@ class BuildReport:
         return report
 
     def print_summary(self) -> None:
-        print(f"Wrote {self.total} transactions to {self.db_path}")
+        print(
+            f"Processed {self.total_processed} transactions from source files ({self.db_path})"
+        )
         for source, n in self.per_source.items():
             categorised = self.per_source_categorised.get(source, 0)
             print(f"  {source}: {n} ({categorised} categorised)")
+        print(f"Database now has {self.total_in_db} rows total.")
 
 
 # ---------------------------------------------------------------------------
-# Builder — owns the engine/session, wires loaders to their CSV paths, writes
-# everything to a fresh SQLite file.
+# Builder — owns the engine/session, wires loaders to their CSV paths, merges
+# everything into the SQLite file (insert new ids, update existing ones).
 # ---------------------------------------------------------------------------
 
 
@@ -321,11 +384,17 @@ class FinanceDatabaseBuilder:
             .add_source(NationwideLoader(), "nationwide.csv")
             .build()
         )
+
+    Re-running .build() against the same or overlapping CSVs is safe: rows are
+    keyed by a deterministic id (see module docstring), so matching rows are
+    updated in place via session.merge() rather than duplicated, and nothing
+    is ever wiped. The one deliberate exception is `category`: if a row
+    already has one and the freshly-loaded version doesn't, the existing
+    category is preserved rather than clobbered back to NULL.
     """
 
-    def __init__(self, db_path: str | Path, fresh: bool = True):
+    def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
-        self.fresh = fresh
         self._sources: list[tuple[TransactionLoader, Path]] = []
 
     def add_source(
@@ -336,13 +405,23 @@ class FinanceDatabaseBuilder:
         return self
 
     def build(self) -> BuildReport:
-        if self.fresh and self.db_path.exists():
-            self.db_path.unlink()  # start fresh each run
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         engine = create_engine(f"sqlite:///{self.db_path}")
-        Base.metadata.create_all(engine)
+        Base.metadata.create_all(engine)  # no-op if tables already exist
         Session = sessionmaker(bind=engine)
         session = Session()
+
+        # Preserve existing categories: a re-run must never clobber a category
+        # that classify_transactions.py (or the direct Monzo/Amex mapping from
+        # a previous run) already set, just because this run's fresh row
+        # doesn't have one (true for every Nationwide row, always).
+        existing_categories: dict[str, Category] = {
+            row.source_id: row.category
+            for row in session.execute(
+                select(Transaction).where(Transaction.category.is_not(None))
+            ).scalars()
+        }
 
         all_rows: list[Transaction] = []
         for loader, path in self._sources:
@@ -351,11 +430,23 @@ class FinanceDatabaseBuilder:
         if not all_rows:
             raise ValueError("No transactions were loaded from any registered source.")
 
-        session.add_all(all_rows)
-        session.add(State(last_entry_date=max(r.date for r in all_rows)))
+        for row in all_rows:
+            if row.category is None and row.source_id in existing_categories:
+                row.category = existing_categories[row.source_id]
+            session.merge(
+                row
+            )  # insert if new source_id, update in place if it already exists
+
+        # Singleton state row — merge (not add) so re-runs update it rather than
+        # colliding on the same id=1 primary key.
+        session.merge(State(id=1, last_entry_date=max(r.date for r in all_rows)))
+
         session.commit()
 
-        report = BuildReport.from_rows(self.db_path, all_rows)
+        total_in_db = session.execute(select(Transaction)).scalars().unique()
+        total_in_db = sum(1 for _ in total_in_db)
+
+        report = BuildReport.from_rows(self.db_path, all_rows, total_in_db)
         session.close()
         return report
 

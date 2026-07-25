@@ -4,7 +4,6 @@ from pydantic import BaseModel
 
 
 class Transaction(BaseModel):
-    id: int
     source: str
     source_id: str | None = None
     date: datetime.date
