@@ -15,13 +15,27 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from sqlalchemy import MetaData, Table, and_, case, create_engine, func, or_, select
 
-BACKEND_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_DB_PATH = BACKEND_DIR.parent / "src" / "data" / "transactions.db"
-DB_PATH = Path(os.environ.get("DB_PATH", DEFAULT_DB_PATH)).resolve()
+from .models.schemas import (
+    CategoryTotal,
+    DayTotal,
+    Merchant,
+    Meta,
+    MonthTotal,
+    Summary,
+    Transaction,
+    TransactionPage,
+)
+
+# Rigid absolute path (will break if project moves)
+DEFAULT_DB_PATH = Path(
+    "/Users/pierrehinds/Repos/finance_tracker/src/data/transactions.db"
+)
+
+DB_PATH = Path(os.getenv("DB_PATH", DEFAULT_DB_PATH)).resolve()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 
 engine = create_engine(f"sqlite:///{DB_PATH}")
 metadata = MetaData()
@@ -47,81 +61,6 @@ def date_filters(start: datetime.date | None, end: datetime.date | None):
     if end:
         conds.append(transactions.c.date <= end)
     return conds
-
-
-# ---------- schemas ----------
-
-
-class Transaction(BaseModel):
-    id: int
-    source: str
-    source_id: str | None = None
-    date: datetime.date
-    time: datetime.time | None = None
-    description: str
-    amount: float
-    currency: str | None = None
-    balance: float | None = None
-    category_raw: str | None = None
-    transaction_type: str | None = None
-    address: str | None = None
-    town_city: str | None = None
-    postcode: str | None = None
-    country: str | None = None
-    notes: str | None = None
-    extended_details: str | None = None
-    classified_at: str | None = None
-
-
-class TransactionPage(BaseModel):
-    total: int
-    page: int
-    page_size: int
-    results: list[Transaction]
-
-
-class CategoryTotal(BaseModel):
-    category: str
-    total_spend: float
-    total_income: float
-    count: int
-
-
-class MonthTotal(BaseModel):
-    month: str  # YYYY-MM
-    total_spend: float
-    total_income: float
-    net: float
-
-
-class DayTotal(BaseModel):
-    day: str  # YYYY-MM-DD
-    total_spend: float
-    total_income: float
-    net: float
-    count: int
-
-
-class Summary(BaseModel):
-    total_income: float
-    total_spend: float
-    net: float
-    transaction_count: int
-    uncategorised_count: int
-    date_range: dict
-
-
-class Merchant(BaseModel):
-    description: str
-    total_spend: float
-    count: int
-
-
-class Meta(BaseModel):
-    min_date: datetime.date | None
-    max_date: datetime.date | None
-    sources: list[str]
-    categories: list[str]
 
 
 # ---------- routes ----------
