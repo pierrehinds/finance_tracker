@@ -5,23 +5,23 @@ Serves data out of transactions.db (built by build_db.py / classify_transactions
 to the React frontend.
 
 Run:
-    export DB_PATH=transactions.db   # optional, this is the default
+    export DB_PATH=src/data/transactions.db   # optional, this is the default
     uvicorn main:app --reload --port 8000
 """
 
+import datetime
 import os
-from datetime import date
-from typing import Optional
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import MetaData, Table, and_, case, create_engine, func, or_, select
 
-DB_PATH = os.environ.get(
-    "/Users/pierrehinds/Documents/Repos/FinanceTracker/src/data/transactions.db",
-    "transactions.db",
-)
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DB_PATH = BACKEND_DIR.parent / "src" / "data" / "transactions.db"
+DB_PATH = Path(os.environ.get("DB_PATH", DEFAULT_DB_PATH)).resolve()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(f"sqlite:///{DB_PATH}")
 metadata = MetaData()
@@ -40,7 +40,7 @@ app.add_middleware(
 # ---------- helpers ----------
 
 
-def date_filters(start: Optional[date], end: Optional[date]):
+def date_filters(start: datetime.date | None, end: datetime.date | None):
     conds = []
     if start:
         conds.append(transactions.c.date >= start)
@@ -55,22 +55,22 @@ def date_filters(start: Optional[date], end: Optional[date]):
 class Transaction(BaseModel):
     id: int
     source: str
-    source_id: Optional[str] = None
-    date: date
-    time: Optional[str] = None
+    source_id: str | None = None
+    date: datetime.date
+    time: datetime.time | None = None
     description: str
     amount: float
-    currency: Optional[str] = None
-    balance: Optional[float] = None
-    category_raw: Optional[str] = None
-    transaction_type: Optional[str] = None
-    address: Optional[str] = None
-    town_city: Optional[str] = None
-    postcode: Optional[str] = None
-    country: Optional[str] = None
-    notes: Optional[str] = None
-    extended_details: Optional[str] = None
-    classified_at: Optional[str] = None
+    currency: str | None = None
+    balance: float | None = None
+    category_raw: str | None = None
+    transaction_type: str | None = None
+    address: str | None = None
+    town_city: str | None = None
+    postcode: str | None = None
+    country: str | None = None
+    notes: str | None = None
+    extended_details: str | None = None
+    classified_at: str | None = None
 
 
 class TransactionPage(BaseModel):
@@ -118,8 +118,8 @@ class Merchant(BaseModel):
 
 
 class Meta(BaseModel):
-    min_date: Optional[date]
-    max_date: Optional[date]
+    min_date: datetime.date | None
+    max_date: datetime.date | None
     sources: list[str]
     categories: list[str]
 
@@ -151,7 +151,7 @@ def get_meta():
 
 
 @app.get("/api/summary", response_model=Summary)
-def get_summary(start: Optional[date] = None, end: Optional[date] = None):
+def get_summary(start: datetime.date | None = None, end: datetime.date | None = None):
     conds = date_filters(start, end)
     with engine.connect() as conn:
         row = conn.execute(
@@ -197,7 +197,9 @@ def get_summary(start: Optional[date] = None, end: Optional[date] = None):
 
 
 @app.get("/api/categories", response_model=list[CategoryTotal])
-def get_categories(start: Optional[date] = None, end: Optional[date] = None):
+def get_categories(
+    start: datetime.date | None = None, end: datetime.date | None = None
+):
     conds = date_filters(start, end)
     query = (
         select(
@@ -238,7 +240,7 @@ def get_categories(start: Optional[date] = None, end: Optional[date] = None):
 
 
 @app.get("/api/monthly", response_model=list[MonthTotal])
-def get_monthly(start: Optional[date] = None, end: Optional[date] = None):
+def get_monthly(start: datetime.date | None = None, end: datetime.date | None = None):
     conds = date_filters(start, end)
     month_expr = func.strftime("%Y-%m", transactions.c.date)
     query = (
@@ -275,7 +277,7 @@ def get_monthly(start: Optional[date] = None, end: Optional[date] = None):
 
 
 @app.get("/api/calendar", response_model=list[DayTotal])
-def get_calendar(start: Optional[date] = None, end: Optional[date] = None):
+def get_calendar(start: datetime.date | None = None, end: datetime.date | None = None):
     conds = date_filters(start, end)
     query = (
         select(
@@ -342,11 +344,11 @@ def get_category_merchants(category: str, limit: int = 15):
 def get_transactions(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
-    search: Optional[str] = None,
-    category: Optional[str] = None,
-    source: Optional[str] = None,
-    start: Optional[date] = None,
-    end: Optional[date] = None,
+    search: str | None = None,
+    category: str | None = None,
+    source: str | None = None,
+    start: datetime.date | None = None,
+    end: datetime.date | None = None,
     sort: str = "date_desc",
 ):
     conds = date_filters(start, end)
@@ -410,4 +412,4 @@ def get_transaction(transaction_id: int):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "db_path": DB_PATH}
+    return {"status": "ok", "db_path": str(DB_PATH)}

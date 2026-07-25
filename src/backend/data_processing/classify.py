@@ -3,13 +3,19 @@ classify_transactions.py
 
 Reads uncategorised transactions out of transactions.db (created by
 build_db.py) one calendar day at a time, sends each day's batch to a local
-Gemma 4 12B model running under Ollama (via LiteLLM), and writes the
-results back to the same row.
+Gemma 3 12B model running under Ollama, and writes the results back to the
+same row.
+
+Categories come from the shared `Category` enum in models.py — the same
+canonical set build_db.py uses for Monzo/Amex — so there's exactly one
+definition of what a valid category is anywhere in the project. In practice
+this script mostly only has Nationwide rows to do, since Monzo/Amex already
+get categorised directly in build_db.py.
 
 Setup:
-    ollama pull gemma4:12b
+    ollama pull gemma3:12b
     ollama serve                      # if not already running as a service
-    pip install litellm sqlalchemy
+    pip install ollama sqlalchemy
 
     # optional, only needed if Ollama isn't on the default host/port:
     export OLLAMA_API_BASE="http://localhost:11434"
@@ -24,44 +30,41 @@ import time
 from collections import defaultdict
 
 import ollama
+from models.tables import Category
 from sqlalchemy import MetaData, Table, create_engine, select, update
 
-MODEL = "gemma4:12b"  # local model served by Ollama
+MODEL = "gemma3:12b"  # local model served by Ollama
 API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 client = ollama.Client(host=API_BASE)
 
-
-CATEGORIES = [
-    "Groceries",
-    "Eating Out",
-    "Bars & Cafés",
-    "Entertainment",
-    "Shopping",
-    "Transport",
-    "Travel",
-    "Bills & Utilities",
-    "Health & Personal Care",
-    "Professional Services",
-    "Finances & Fees",
-    "Transfers",
-    "Income",
-    "Gifts",
-    "Sports & Hobbies",
-    "Other",
-]
+CATEGORIES = [c.value for c in Category]
 
 SYSTEM_PROMPT = f"""You are a personal-finance transaction classifier.
 
 Classify each transaction below into exactly one of these categories:
 {", ".join(CATEGORIES)}
 
-Rules:
-- Use "Income" for salary, refunds, and money coming in.
-- Use "Transfers" for money moved between the person's own accounts (e.g. Monzo-to-Monzo, savings pots), not purchases.
-- Use "Transport" for daily commuting (TfL, buses, trains, fuel, parking, taxis/rideshare for ordinary travel).
-- Use "Travel" only for holidays/trips (flights, hotels, foreign transactions while travelling).
-- Use "Bars & Cafés" for coffee shops, pubs, and bars; use "Eating Out" for restaurants and takeaways.
-- If genuinely unclear, use "Other".
+Rules / what each category means:
+- "Groceries": supermarkets.
+- "Eating out": restaurants and takeaways.
+- "Shopping": general retail — clothes, electronics, department stores, online purchases.
+- "Entertainment": cinema, streaming, events, hobbies, music/video.
+- "Transport": daily commuting — buses, trains, tube, fuel, parking, taxis/rideshare for ordinary travel.
+- "Holidays": trips away — flights, hotels, foreign transactions while travelling. Not day-to-day commuting.
+- "Bills": recurring essential household bills — utilities, council tax, insurance, rent/mortgage.
+- "Monthly Payments": other recurring monthly payments that aren't core household bills (e.g. subscriptions).
+- "Personal care": health, pharmacy, grooming, medical.
+- "Expenses": work/business expenses likely to be reimbursed.
+- "Finances": fees, interest, savings, investments, financial admin.
+- "Transfers": money moved between the person's own accounts (e.g. Monzo-to-Monzo, savings pots) — not a purchase.
+- "Money Owed": repaying or receiving money between friends/family for shared costs — not a business transfer.
+- "Income": salary, refunds, and other money coming in that isn't a transfer between own accounts.
+- "Gifts": presents bought for other people.
+- "Arsenal": spending specifically related to Arsenal FC (tickets, merchandise, subscriptions).
+- "Golf": golf-related spending (green fees, equipment, club membership).
+- "General": everyday miscellaneous spend that doesn't clearly fit any category above.
+
+If genuinely unclear, use "General".
 
 You will be given a numbered list of transactions for a single day. Respond ONLY with a JSON object
 of the form {{"categories": ["Category1", "Category2", ...]}} with exactly one category per transaction,
@@ -101,7 +104,7 @@ def classify_day(day, rows, model=MODEL, max_retries=3):
             cleaned = []
             for cat in categories:
                 cat = cat.strip()
-                cleaned.append(cat if cat in CATEGORIES else "Other")
+                cleaned.append(cat if cat in CATEGORIES else Category.GENERAL.value)
             return cleaned
 
         except Exception as e:
@@ -115,7 +118,7 @@ def classify_day(day, rows, model=MODEL, max_retries=3):
     result = list([None] * len(rows))
     for i, row in enumerate(rows):
         if row.source == "amex" and "TFL" in (row.description or "").upper():
-            result[i] = "Transport"
+            result[i] = Category.TRANSPORT.value
     return result
 
 
@@ -132,6 +135,7 @@ def main():
         query = select(transactions)
         if cutoff_date is not None:
             query = query.where(transactions.c.date > cutoff_date)
+        query = query.where(transactions.c.category.is_(None))
         query = query.order_by(transactions.c.date)
         all_rows = conn.execute(query).all()
 
@@ -161,7 +165,7 @@ def main():
                 conn.execute(
                     update(transactions)
                     .where(transactions.c.id == row.id)
-                    .values(category=category)
+                    .values(category=Category(category))
                 )
                 total_classified += 1
                 conn.execute(update(state).values(date_classified_upto=day))
